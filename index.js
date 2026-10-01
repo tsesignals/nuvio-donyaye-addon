@@ -2,13 +2,13 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 const cheerio = require("cheerio");
 
-const BASE_URL = "https://donyayeserial-new1.top"; // Update domain if it rotates
+const BASE_URL = "https://donyayeserial-new1.top"; // Update if their active search domain changes
 
 const manifest = {
   id: "org.donyaye-serial.nuvio",
-  version: "1.0.0",
+  version: "1.2.0",
   name: "Donyaye Serial",
-  description: "Donyaye Serial streams for Nuvio",
+  description: "Donyaye Serial streams with qualities and subtitles for Nuvio",
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
@@ -17,11 +17,14 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// 1. Resolve title from IMDB ID using Cinemeta
+// 1. Fetch metadata from Cinemeta using IMDB ID
 async function getMediaMeta(type, imdbId) {
   try {
     const metaType = type === "series" ? "series" : "movie";
-    const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`, { timeout: 5000 });
+    const res = await axios.get(
+      `https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`,
+      { timeout: 6000 }
+    );
     return res.data?.meta || null;
   } catch (err) {
     console.error("Cinemeta lookup failed:", err.message);
@@ -29,17 +32,19 @@ async function getMediaMeta(type, imdbId) {
   }
 }
 
-// 2. Search Donyaye Serial for the content page
+// 2. Search Donyaye Serial for the post page
 async function searchDonyayeSerial(title) {
   try {
     const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(title)}`;
     const { data: html } = await axios.get(searchUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
       timeout: 8000
     });
 
     const $ = cheerio.load(html);
-    // Find the first post link in search results
     const postLink = $("article a, .post-title a, h2 a").first().attr("href");
     return postLink || null;
   } catch (err) {
@@ -48,42 +53,79 @@ async function searchDonyayeSerial(title) {
   }
 }
 
-// 3. Extract direct download/stream links from the post page
+// 3. Helper to format a clean, detailed stream label for Nuvio
+function parseStreamDetails(url) {
+  const decoded = decodeURIComponent(url);
+  const filename = decoded.split("/").pop();
+
+  // Extract Resolution
+  const resMatch = filename.match(/\b(480p|720p|1080p|2160p|4k)\b/i);
+  const resolution = resMatch ? resMatch[0].toUpperCase() : "HD";
+
+  // Extract Source & Codec
+  const sourceMatch = filename.match(/\b(BluRay|WEB-DL|WEBRip|HDTV)\b/i);
+  const codecMatch = filename.match(/\b(x265|x264|hevc|10bit)\b/i);
+  const source = sourceMatch ? sourceMatch[0] : "";
+  const codec = codecMatch ? codecMatch[0] : "";
+
+  // Extract Dubbed or Subtitle Tag
+  let tag = "";
+  if (/softsub|زیرنویس/i.test(decoded)) {
+    tag = "SoftSub (زیرنویس)";
+  } else if (/dub|دوبله|farsi/i.test(decoded)) {
+    tag = "Persian Dub (دوبله)";
+  }
+
+  const qualityTitle = [resolution, source, codec, tag]
+    .filter(Boolean)
+    .join(" • ");
+
+  return {
+    name: `Donyaye Serial\n${resolution}`,
+    title: qualityTitle || filename
+  };
+}
+
+// 4. Scrape the post page for matching stream URLs
 async function extractStreams(pageUrl, type, season, episode) {
   try {
     const { data: html } = await axios.get(pageUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
       timeout: 8000
     });
 
     const $ = cheerio.load(html);
     const streams = [];
 
-    // Format season and episode tags (e.g., S01E01)
+    // Target tags: e.g. S01E01 or s1e1
     const sPad = String(season).padStart(2, "0");
     const ePad = String(episode).padStart(2, "0");
-    const targetTag = `S${sPad}E${ePad}`.toLowerCase();
+    const targetTag1 = `s${sPad}e${ePad}`.toLowerCase();
+    const targetTag2 = `s${season}e${episode}`.toLowerCase();
 
-    // Iterate through all anchor tags containing media files
     $("a[href*='.mp4'], a[href*='.mkv']").each((_, el) => {
       const link = $(el).attr("href");
-      const text = $(el).text().trim() || "";
-
       if (!link) return;
 
+      const lowerLink = link.toLowerCase();
+
       if (type === "series") {
-        // Match specific season and episode markers
-        const lowerLink = link.toLowerCase();
-        if (lowerLink.includes(targetTag) || lowerLink.includes(`s${season}e${episode}`)) {
+        if (lowerLink.includes(targetTag1) || lowerLink.includes(targetTag2)) {
+          const info = parseStreamDetails(link);
           streams.push({
-            title: `Donyaye Serial - ${text || `S${sPad}E${ePad}`}`,
+            name: info.name,
+            title: info.title,
             url: link
           });
         }
       } else {
-        // Movies: return available qualities
+        const info = parseStreamDetails(link);
         streams.push({
-          title: `Donyaye Serial - ${text || "Play Movie"}`,
+          name: info.name,
+          title: info.title,
           url: link
         });
       }
@@ -96,26 +138,26 @@ async function extractStreams(pageUrl, type, season, episode) {
   }
 }
 
-// Main stream handler
+// 5. Main Stream Handler
 builder.defineStreamHandler(async ({ type, id }) => {
   const parts = id.split(":");
   const imdbId = parts[0];
   const season = parts[1] || null;
   const episode = parts[2] || null;
 
-  // Step 1: Get metadata
+  // Resolve media title
   const meta = await getMediaMeta(type, imdbId);
   if (!meta || !meta.name) {
     return { streams: [] };
   }
 
-  // Step 2: Search site
+  // Find post page on Donyaye Serial
   const postUrl = await searchDonyayeSerial(meta.name);
   if (!postUrl) {
     return { streams: [] };
   }
 
-  // Step 3: Scrape stream links
+  // Extract links
   const streams = await extractStreams(postUrl, type, season, episode);
 
   return { streams };
